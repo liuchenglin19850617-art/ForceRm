@@ -1,0 +1,2 @@
+# ForceRm
+ForceRm 适用于Windows的轻量级垃圾清理，其清理能力与clearmgr.exe清理能力相比有显著清理差异适用于办公时的常用软件清理。他并不会清理
