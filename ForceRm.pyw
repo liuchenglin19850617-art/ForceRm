@@ -6,13 +6,13 @@ ForceRm 清理工具 (Rubbish Cleaner)
 
 原生引擎 LibRC.dll（C/C++）：
   - 负责底层 Windows 操作：回收站删除、永久删除、管理员提权强制删除、写 WinERR.log。
-  - 各类软件的清理规则以独立 .json 存放在 LibRC/ 目录（单个文件单个软件），由本程序加载。
+  - LibRm/ 只保留人工校准的精确规则；其余软件缓存由智能扫描按目录关键字识别。
   - 若 LibRC.dll 缺失，自动回退到纯 Python 实现（功能一致，仅强制删除能力受限）。
 
 设计原则（安全第一）：
   1. 只清理「白名单」内的临时 / 缓存文件，绝不触碰系统目录。
   2. 清理前必须先「扫描」并手动确认，不会静默删除。
-  3. 默认「移入回收站」（可恢复），可切换为直接删除。
+  3. 直接删除（不可恢复），清理前需先扫描并确认。
   4. 自动跳过被占用（正在使用）的文件，不中断整体流程。
   5. 不跟随符号链接 / 目录 junctions，避免误删其它盘的数据。
   6. 无法删除的文件：先尝试管理员提权强制删除，仍失败则跳过并在同级目录写 WinERR.log。
@@ -71,12 +71,18 @@ try:
 except ImportError:
     PIL_OK = False
 
-# logo 资源：与本程序同目录的 logo.png；缺失时自动退回文字标记
-try:
-    _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-except NameError:
-    _BASE_DIR = os.getcwd()
-LOGO_PATH = os.path.join(_BASE_DIR, "logo.png")
+# 资源目录：源码运行时是脚本目录，冻结后是 exe 所在目录
+def _resource_dir() -> str:
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    try:
+        return os.path.dirname(os.path.abspath(__file__))
+    except NameError:
+        return os.getcwd()
+
+
+APP_DIR = _resource_dir()
+LOGO_PATH = os.path.join(APP_DIR, "logo.png")
 
 # 加载动画帧（旋转的半圆，Segoe UI 等常见字体均支持）
 SPIN_FRAMES = "◐◓◑◒"
@@ -141,6 +147,202 @@ PROGRAMDATA = os.environ.get("ProgramData", r"C:\ProgramData")
 TEMP = os.environ.get("TEMP", "") or os.environ.get("TMP", "")
 USERPROFILE = os.environ.get("USERPROFILE", os.path.expanduser("~"))
 
+# --------------------------------------------------------------------------
+# 智能软件缓存识别：目录关键字 + 一次遍历，不依赖静态软件名库
+#
+# 新增软件无需往 LibRm 里加 json：只要它把缓存放在 AppData 下，
+# 用 cache / crashpad / temp / logs 这类通用目录名就能被自动识别。
+# 关键字集合是代码里的固定常量，规则文件不会随软件数量增长。
+# --------------------------------------------------------------------------
+def _norm_name(s: str) -> str:
+    """目录名归一化：小写、去掉空格/下划线/连字符/点，兼容各种写法。"""
+    return "".join(c for c in s.lower() if c.isalnum())
+
+
+# 命中即判定为缓存目录（归一化后精确匹配）
+SMART_DIR_KEYS = {
+    "cache", "cache2", "cache3", "cachestorage", "cachedata", "cachedimages",
+    "cachedownloads", "cacheindex", "code cache", "gpu cache",
+    "shader cache", "dawn cache", "grshader cache", "blob storage",
+    "service worker", "webcache", "httpcache", "media cache",
+    "media cache files", "manifestcache", "assetcache", "texturecache",
+    "fontcache", "imagecache", "networkcache", "diskcache", "downloadcache",
+    "installercache", "packagecache", "updatecache", "inetcache",
+    "crashpad", "crashdumps", "crashreports", "crashes", "dumps", "minidumps",
+    "thumbnails", "thumbnailcache", "iconcache", "previews",
+    "temp", "tmp", "tempstate", "tempfiles", "tmpfiles", "temporary",
+    "cachetmp", "logs", "log", "logfiles", "diagnostics", "webview2 cache",
+}
+SMART_DIR_KEYS = {_norm_name(x) for x in SMART_DIR_KEYS}
+
+# 带这些词的目录即使名字像缓存也不碰：
+# 前半是配置/账号/凭据，后半是已解压的 SDK / 工具链（删了要重新联网下载）
+SMART_BLOCK_WORDS = (
+    "config", "settings", "preference", "profile", "account", "credential",
+    "password", "wallet", "keys", "certificate", "token", "localstate",
+    "bookmark", "favorite", "backup", "restore", "synced",
+    "sdk", "runtime", "toolchain", "compiler", "nuget", "gradle",
+    "maven", "wheels", "venv", "conda",
+)
+
+# 不递归遍历的目录（非缓存或用户数据）
+SMART_SKIP_DIRS = {_norm_name(x) for x in (
+    "node_modules", ".git", ".svn", "__pycache__", "system32",
+    "windows", "$recycle.bin", "winsxs", "servicing", "windowsapps",
+    "saves", "savegames", "save games",
+    "documents", "projects", "workspace", "vault", "wallet",
+    "keystore", "credentials", "identity", "accounts",
+)}
+
+# 明确的临时残留后缀；只在名字带「临时」语义的目录里收集
+SMART_FILE_EXTS = (
+    ".tmp", ".temp", ".old", ".bak", ".dmp", ".chk", ".gid",
+    ".crdownload", ".part", ".partial", ".cache",
+)
+SMART_TRANSIENT_WORDS = (
+    "temp", "tmp", "cache", "log", "crash", "dump", "download",
+    "update", "install", "junk", "trash",
+)
+
+# 无论在哪都不删的文件名（前缀匹配，覆盖 Cookies-journal 等）
+SMART_KEEP_FILES = {_norm_name(x) for x in (
+    "local state", "login data", "cookies", "history", "bookmarks",
+    "preferences", "secure preferences", "web data", "favicons",
+    "current session", "last session", "trusted vault",
+)}
+
+SMART_MAX_DEPTH = 7            # 单个软件目录最多向下 7 层，避免病态深树
+SMART_ROOTS = [LOCAL, ROAMING]  # Programs / Packages 已在 LOCAL 下，不重复扫描
+
+SMART_TARGET = {
+    "key": "smart_software_cache",
+    "type": "smart",
+    "name": "智能软件缓存",
+    "desc": "按缓存目录关键字与临时文件后缀自动识别，未知软件同样覆盖",
+    "paths": [],
+    "patterns": [],
+    "risk": "低",
+    "default": False,
+}
+
+
+def _is_cache_dir(name: str) -> bool:
+    k = _norm_name(name)
+    if not k or k in SMART_SKIP_DIRS:
+        return False
+    if any(w in k for w in SMART_BLOCK_WORDS):
+        return False
+    if k in SMART_DIR_KEYS:
+        return True
+    # 兼容软件自带前缀，如 FooCache / FooCrashDumps / INetCache
+    if len(k) <= 28 and (k.endswith("cache") or k.endswith("crashdumps")):
+        return True
+    return False
+
+
+def _keep_file(path: str) -> bool:
+    n = _norm_name(os.path.basename(path))
+    return any(n.startswith(k) for k in SMART_KEEP_FILES)
+
+
+def _precise_roots() -> set:
+    """精确规则覆盖的目录：智能扫描跳过，避免同一批文件被重复统计。"""
+    out = set()
+    for t in JUNK_TARGETS:
+        if t.get("type") in ("action", "smart"):
+            continue
+        for p in t.get("paths", []):
+            if p:
+                out.add(os.path.normcase(os.path.normpath(os.path.expandvars(p))))
+    return out
+
+
+def _scan_branch(base: str, skip: set) -> set:
+    """遍历一个一级软件目录；命中缓存目录后收集子树并剪枝，不重复遍历。"""
+    out = set()
+    for cur, dirs, fnames in os.walk(base, topdown=True):
+        if cur[len(base):].count(os.sep) >= SMART_MAX_DEPTH:
+            dirs[:] = []
+        kept = []
+        for d in dirs:
+            p = os.path.join(cur, d)
+            n = _norm_name(d)
+            if is_link(p) or n in SMART_SKIP_DIRS:
+                continue
+            if os.path.normcase(os.path.normpath(p)) in skip:
+                continue
+            kept.append(d)
+        dirs[:] = kept
+
+        if _is_cache_dir(os.path.basename(cur)):
+            for r2, d2, f2 in os.walk(cur):
+                d2[:] = [x for x in d2 if not is_link(os.path.join(r2, x))]
+                for fn in f2:
+                    fp = os.path.join(r2, fn)
+                    if not is_link(fp) and not _keep_file(fp):
+                        out.add(fp)
+            dirs[:] = []
+            continue
+
+        if any(w in _norm_name(os.path.basename(cur)) for w in SMART_TRANSIENT_WORDS):
+            for fn in fnames:
+                fp = os.path.join(cur, fn)
+                if is_link(fp) or _keep_file(fp):
+                    continue
+                if fn.lower().endswith(SMART_FILE_EXTS):
+                    out.add(fp)
+    return out
+
+
+def smart_collect() -> list:
+    """扫描本机 AppData，按关键字智能识别所有软件的缓存文件。"""
+    skip = _precise_roots()
+    branches = []
+    for root in SMART_ROOTS:
+        if not root or not os.path.isdir(root) or is_link(root):
+            continue
+        try:
+            subs = [
+                os.path.join(root, d) for d in os.listdir(root)
+                if os.path.isdir(os.path.join(root, d))
+                and not is_link(os.path.join(root, d))
+                and os.path.normcase(os.path.normpath(os.path.join(root, d))) not in skip
+            ]
+        except OSError:
+            subs = []
+        branches.extend(subs or [root])
+
+    files = set()
+    n = worker_count()
+    with ThreadPoolExecutor(max_workers=n) as ex:
+        for fu in as_completed([ex.submit(_scan_branch, b, skip) for b in branches]):
+            try:
+                files.update(fu.result())
+            except Exception:
+                pass
+    return list(files)
+
+
+def prune_smart_dirs(files) -> int:
+    """智能清理后，删除本次扫描命中的、已清空的缓存目录（不动其它目录）。"""
+    roots = set()
+    for f in files:
+        d = os.path.dirname(f)
+        while d:
+            if _is_cache_dir(os.path.basename(d)):
+                roots.add(d)
+                break
+            p = os.path.dirname(d)
+            if p == d:
+                break
+            d = p
+    for r in roots:
+        try:
+            remove_empty_dirs(r)
+        except Exception:
+            pass
+    return len(roots)
+
 
 def load_software_targets(lib_dir: str) -> list:
     """从 LibRC 目录加载各类软件的独立 .json 清理定义（单个文件单个软件）。"""
@@ -148,6 +350,9 @@ def load_software_targets(lib_dir: str) -> list:
     if not os.path.isdir(lib_dir):
         return targets
     for fp in sorted(glob.glob(os.path.join(lib_dir, "*.json"))):
+        # 智能扫描已取代软件名聚合规则，旧版残留一律不加载
+        if os.path.basename(fp).startswith("frm_lib_"):
+            continue
         try:
             with open(fp, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
@@ -270,8 +475,11 @@ JUNK_TARGETS = [
 ]
 
 # 从 LibRC 目录加载各类软件的独立 .json 定义
-LIBRC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "LibRC")
-JUNK_TARGETS += load_software_targets(LIBRC_DIR)
+LIBRM_DIR = os.path.join(APP_DIR, "LibRm")
+if not os.path.isdir(LIBRM_DIR):
+    LIBRM_DIR = os.path.join(APP_DIR, "LibRC")
+LIBRC_DIR = LIBRM_DIR
+JUNK_TARGETS += load_software_targets(LIBRM_DIR)
 
 # --------------------------------------------------------------------------
 # 深度清理：系统工具动作（非文件扫描，直接调用系统能力）
@@ -296,6 +504,7 @@ DEEP_ACTIONS = [
 ]
 
 JUNK_TARGETS += DEEP_ACTIONS
+JUNK_TARGETS.append(SMART_TARGET)
 
 # 深度清理项排到列表末尾（sort 稳定，保持相对顺序）
 JUNK_TARGETS.sort(key=lambda t: 1 if (t.get("deep") or t.get("type") == "action") else 0)
@@ -374,7 +583,7 @@ def _sh_delete(paths: list) -> int:
 
 
 def move_to_recycle_bin(path: str) -> bool:
-    """通过 SHFileOperation 将单个文件移入回收站（可恢复）。成功返回 True。"""
+    """通过 SHFileOperation 将单个文件移入回收站。成功返回 True（当前未调用）。"""
     try:
         return _sh_delete([path]) == 0
     except Exception:
@@ -510,7 +719,7 @@ def write_winerr(file_path: str, error_msg: str) -> None:
         except Exception:
             pass
         try:
-            here = os.path.dirname(os.path.abspath(__file__))
+            here = APP_DIR
             with open(os.path.join(here, "WinERR.log"), "a", encoding="utf-8") as fh:
                 fh.write(line)
         except Exception:
@@ -522,8 +731,8 @@ def write_winerr(file_path: str, error_msg: str) -> None:
 # --------------------------------------------------------------------------
 LibRC = None
 _DLL_CANDIDATES = [
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "LibRC.dll"),
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "LibRC", "LibRC.dll"),
+    os.path.join(APP_DIR, "LibRC.dll"),
+    os.path.join(APP_DIR, "LibRC", "LibRC.dll"),
 ]
 for _dll in _DLL_CANDIDATES:
     try:
@@ -658,7 +867,7 @@ def run_deep_action(name: str):
 # --------------------------------------------------------------------------
 # 自动提权（UAC）
 # --------------------------------------------------------------------------
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 
 
 def load_settings() -> dict:
@@ -696,8 +905,12 @@ def run_as_admin() -> bool:
             ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_int,
         )
         shell32.ShellExecuteW.restype = ctypes.c_void_p
-        exe = sys.executable or "pythonw.exe"
-        params = '"%s" --elevated' % os.path.abspath(__file__)
+        if getattr(sys, "frozen", False):
+            exe = sys.executable
+            params = "--elevated"
+        else:
+            exe = sys.executable or "pythonw.exe"
+            params = '"%s" --elevated' % os.path.abspath(__file__)
         # 第 6 个参数 SW_SHOWNORMAL = 1
         ret = shell32.ShellExecuteW(None, "runas", exe, params, None, 1)
         return ret is not None and int(ret) > 32
@@ -772,7 +985,7 @@ class App(ctk.CTk):
             font=ctk.CTkFont(size=19, weight="bold"), text_color=C_TXT,
         ).pack(anchor="w")
         ctk.CTkLabel(
-            title_box, text="轻量 · 安全 · 误删可恢复", anchor="w",
+            title_box, text="直接删除 · 不可恢复", anchor="w",
             font=ctk.CTkFont(size=11), text_color=C_SUB,
         ).pack(anchor="w")
 
@@ -883,15 +1096,9 @@ class App(ctk.CTk):
         ctk.CTkLabel(
             mode_row, text="清理方式", font=ctk.CTkFont(size=11), text_color=C_SUB,
         ).pack(side="left", padx=(0, 8))
-        self.mode_var = ctk.StringVar(value="回收站（可恢复）")
-        self.mode_seg = ctk.CTkSegmentedButton(
-            mode_row, values=["回收站（可恢复）", "直接删除"],
-            variable=self.mode_var, height=30, font=ctk.CTkFont(size=12),
-            selected_color=C_TEAL, selected_hover_color=C_TEAL_D,
-            unselected_color="#EEF3F6", unselected_hover_color="#E2E9EE",
-            text_color=C_TXT,
-        )
-        self.mode_seg.pack(side="left")
+        ctk.CTkLabel(
+            mode_row, text="直接删除", font=ctk.CTkFont(size=12), text_color=C_TXT,
+        ).pack(side="left")
 
         # 搜索 + 计数 + 全选
         flt = ctk.CTkFrame(main, fg_color="transparent")
@@ -1053,7 +1260,7 @@ class App(ctk.CTk):
                 # 软件垃圾项不单独陈列，仅由总框显示
                 continue
             row.pack_forget()
-            if cat == "软件垃圾":
+            if cat == "软件垃圾" and t.get("type") != "smart":
                 continue
             if cat == "系统垃圾" and key in self.software_keys:
                 continue
@@ -1175,7 +1382,7 @@ class App(ctk.CTk):
                 sz, cnt = recycle_bin_size()
                 return key, sz, cnt, []
             return key, 0, 1, []
-        files = collect_target(t)
+        files = smart_collect() if t.get("type") == "smart" else collect_target(t)
         size = 0
         for f in files:
             try:
@@ -1254,12 +1461,12 @@ class App(ctk.CTk):
             mb.showinfo("提示", "当前勾选项没有可清理的文件。")
             return
 
-        mode = self.mode_var.get()
-        to_bin = (mode == "回收站（可恢复）")
+        mode = "直接删除"
+        to_bin = False
         ans = mb.askyesno(
             "确认清理",
             f"即将清理 {count} 个文件，约 {human_size(total)}。\n"
-            f"方式：{mode}\n\n确定继续吗？",
+            f"方式：{mode}（不可恢复）\n\n确定继续吗？",
         )
         if not ans:
             self._log("已取消清理。")
@@ -1304,7 +1511,12 @@ class App(ctk.CTk):
             file_targets = [t for t in selected if t.get("type") != "action"]
             jobs = []
             for t in file_targets:
-                files = self.file_cache.get(t["key"]) or collect_target(t)
+                if t.get("type") == "smart":
+                    files = self.file_cache.get(t["key"])
+                    if files is None:
+                        files = smart_collect()
+                else:
+                    files = self.file_cache.get(t["key"]) or collect_target(t)
                 files = [f for f in files if os.path.exists(f)]
                 for i in range(0, len(files), DELETE_CHUNK):
                     jobs.append(files[i:i + DELETE_CHUNK])
@@ -1378,6 +1590,11 @@ class App(ctk.CTk):
                             remove_empty_dirs(base)
                         except Exception:
                             pass
+                if t.get("type") == "smart":
+                    try:
+                        prune_smart_dirs(self.file_cache.get(t["key"]) or [])
+                    except Exception:
+                        pass
                 self.after(0, lambda nm=t["name"]: self._log(f"完成 [{nm}]"))
 
             self.after(0, self._finish_clean, freed, ok, fail)
@@ -1410,6 +1627,22 @@ def remove_empty_dirs(base: str) -> None:
 
 # --------------------------------------------------------------------------
 if __name__ == "__main__":
+    # 隐藏自检：验证冻结发行版的资源路径、规则库与智能扫描
+    if "--selftest" in sys.argv:
+        _out = {
+            "frozen": bool(getattr(sys, "frozen", False)),
+            "app_dir": APP_DIR,
+            "lib_dir": LIBRM_DIR,
+            "lib_exists": os.path.isdir(LIBRM_DIR),
+            "lib_rules": len(glob.glob(os.path.join(LIBRM_DIR, "*.json"))),
+            "targets": len(JUNK_TARGETS),
+            "smart": any(t.get("type") == "smart" for t in JUNK_TARGETS),
+            "frm_lib": sum(1 for t in JUNK_TARGETS if t["key"].startswith("frm_lib_")),
+            "smart_files": len(smart_collect()),
+        }
+        with open(os.path.join(APP_DIR, "_selftest.json"), "w", encoding="utf-8") as _fh:
+            json.dump(_out, _fh, ensure_ascii=False, indent=2)
+        sys.exit(0)
     # 自动提权：非管理员且本身不是提权实例时，重启自身申请 UAC 后退出
     if "--elevated" not in sys.argv and not is_admin() \
             and bool(load_settings().get("auto_elevate", True)):
