@@ -19,8 +19,6 @@ Windows 垃圾清理工具，基于 Python 与 CustomTkinter 构建图形界面�
 - `ForceRm.pyw` / `ForceRm-high.pyw`：主程序；high 版另含被占用文件的解锁重试逻辑。
 - `LibRm/LibRm.json`：合并后的规则库，结构为 `{"version":1,"count":238,"targets":[...]}`。该文件缺失或损坏时，加载器回退兼容旧版单软件散文件。
 - `logo.png` / `config.json`：图标与配置，`auto_elevate` 控制是否自动申请管理员权限。
-- `dist-full-v1.0.2.zip`：免安装发行包，解压后运行对应 exe 即可。
-- `GITHUB/`：发布用源码副本。
 - `LICENSE`：GNU AGPL v3.0 全文。
 
 ## 运行
