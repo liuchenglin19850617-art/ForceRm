@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+# SPDX-License-Identifier: AGPL-3.0-only
 """
 ForceRm 清理工具 (Rubbish Cleaner)
 ===================================
@@ -6,7 +7,7 @@ ForceRm 清理工具 (Rubbish Cleaner)
 
 原生引擎 LibRC.dll（C/C++）：
   - 负责底层 Windows 操作：回收站删除、永久删除、管理员提权强制删除、写 WinERR.log。
-  - LibRm/ 只保留人工校准的精确规则；其余软件缓存由智能扫描按目录关键字识别。
+  - LibRm/LibRm.json 是合并后的精确规则库（单文件加载）；其余软件缓存由智能扫描识别。
   - 若 LibRC.dll 缺失，自动回退到纯 Python 实现（功能一致，仅强制删除能力受限）。
 
 设计原则（安全第一）：
@@ -346,20 +347,36 @@ def prune_smart_dirs(files) -> int:
 
 
 def load_software_targets(lib_dir: str) -> list:
-    """从 LibRC 目录加载各类软件的独立 .json 清理定义（单个文件单个软件）。"""
+    """加载规则库：优先一次读合并后的 LibRm.json，缺失或损坏时回退到旧散文件。"""
     targets = []
     if not os.path.isdir(lib_dir):
         return targets
+
+    packed = os.path.join(lib_dir, "LibRm.json")
+    if os.path.isfile(packed):
+        try:
+            with open(packed, "r", encoding="utf-8") as fh:
+                doc = json.load(fh)
+            items = doc.get("targets") if isinstance(doc, dict) else doc
+            if isinstance(items, list):
+                for data in items:
+                    if isinstance(data, dict) and "key" in data:
+                        data["paths"] = [os.path.expandvars(p) for p in data.get("paths", [])]
+                        targets.append(data)
+                return targets
+        except Exception:
+            targets = []
+
+    # 兼容旧版：顶层散文件（跳过聚合规则与合并文件本身）
     for fp in sorted(glob.glob(os.path.join(lib_dir, "*.json"))):
-        # 智能扫描已取代软件名聚合规则，旧版残留一律不加载
-        if os.path.basename(fp).startswith("frm_lib_"):
+        name = os.path.basename(fp)
+        if name.startswith("frm_lib_") or name == "LibRm.json":
             continue
         try:
             with open(fp, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
             if not isinstance(data, dict) or "key" not in data:
                 continue
-            # 解析路径中的 Windows 环境变量（如 %LOCALAPPDATA%）
             data["paths"] = [os.path.expandvars(p) for p in data.get("paths", [])]
             targets.append(data)
         except Exception:
@@ -1865,7 +1882,8 @@ if __name__ == "__main__":
             "app_dir": APP_DIR,
             "lib_dir": LIBRM_DIR,
             "lib_exists": os.path.isdir(LIBRM_DIR),
-            "lib_rules": len(glob.glob(os.path.join(LIBRM_DIR, "*.json"))),
+            "lib_rules": len(load_software_targets(LIBRM_DIR)),
+            "lib_files": len(glob.glob(os.path.join(LIBRM_DIR, "*.json"))),
             "targets": len(JUNK_TARGETS),
             "smart": any(t.get("type") == "smart" for t in JUNK_TARGETS),
             "frm_lib": sum(1 for t in JUNK_TARGETS if t["key"].startswith("frm_lib_")),
