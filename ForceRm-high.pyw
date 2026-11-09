@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
 # SPDX-License-Identifier: AGPL-3.0-only
 """
-ForceRm 清理工具 (Rubbish Cleaner)
-===================================
+ForceRm 清理工具
 基于 Python + CustomTkinter 的 Windows 垃圾文件清理工具。
 
 原生引擎 LibRC.dll（C/C++）：
@@ -50,21 +49,24 @@ if os.name != "nt":
     mb.showerror("系统不支持", "ForceRm 清理工具仅支持 Windows 系统。")
     sys.exit(1)
 
-# 火绒风格：固定浅色主题
+# 固定浅色主题
 ctk.set_appearance_mode("light")
 ctk.set_default_color_theme("blue")
 
-# 品牌色（取自 logo：深青 / 亮蓝 / 柠檬绿）
-C_TEAL = "#146B7E"
-C_TEAL_D = "#0F5566"
-C_BLUE = "#1E9BD7"
-C_BLUE_D = "#1789C0"
-C_GREEN = "#9BCB3C"
-C_BG = "#F4F6F8"
+# 界面配色：浅色底、单一主色
+C_ACCENT = "#2F7DE1"
+C_ACCENT_D = "#2467C4"
+C_TEAL = C_ACCENT
+C_TEAL_D = C_ACCENT_D
+C_BLUE = C_ACCENT
+C_BLUE_D = C_ACCENT_D
+C_GREEN = C_ACCENT
+C_BG = "#F5F7FA"
 C_CARD = "#FFFFFF"
-C_TXT = "#1F2D3D"
+C_TXT = "#25313F"
 C_SUB = "#8A97A6"
 C_BORDER = "#E6EAEF"
+C_HOVER = "#EEF3F8"
 
 # 可选依赖：Pillow（用于显示 logo 与设置窗口图标）
 try:
@@ -86,9 +88,7 @@ def _resource_dir() -> str:
 APP_DIR = _resource_dir()
 LOGO_PATH = os.path.join(APP_DIR, "logo.png")
 
-# 加载动画帧（旋转的半圆，Segoe UI 等常见字体均支持）
-SPIN_FRAMES = "◐◓◑◒"
-SPIN_INTERVAL_MS = 120
+# 进度指示使用控件条，不使用字符动画
 
 # 并发设置：扫描与清理都是 I/O 密集型，用线程池并行加速
 CPU_COUNT = os.cpu_count() or 4
@@ -141,7 +141,7 @@ def is_link(path: str) -> bool:
 
 
 # --------------------------------------------------------------------------
-# 安全清理目标（白名单 · 系统 / 浏览器 / 通用）
+# 安全清理目标（白名单：系统 / 浏览器 / 通用）
 # --------------------------------------------------------------------------
 LOCAL = os.environ.get("LOCALAPPDATA", "")
 ROAMING = os.environ.get("APPDATA", "")
@@ -1170,14 +1170,13 @@ class App(ctk.CTk):
         self.rows: dict = {}             # key -> 行容器（用于搜索过滤）
         self.file_cache: dict = {}       # key -> 扫描到的文件列表（清理时免重复遍历）
         self.working = False
-        self._spin_job = None            # 加载动画的 after 任务
-        self._spin_text = ""             # “正在清理 xx”
-        self._spin_i = 0
+        self._spin_text = ""
+        self._spin_active = False
         self._syncing = False            # 防止 主框<->子项 勾选联动死循环
 
         self._build_ui()
 
-    # ------------------------- UI 构建（火绒风格）-------------------------
+    # ------------------------- UI 构建 -------------------------
     def _build_ui(self):
         self.configure(fg_color=C_BG)
 
@@ -1190,8 +1189,8 @@ class App(ctk.CTk):
         except Exception:
             pass
 
-        # ===== 顶栏：logo + 标题 + 权限 =====
-        header = ctk.CTkFrame(self, fg_color=C_CARD, corner_radius=0, height=68)
+        # 顶栏
+        header = ctk.CTkFrame(self, fg_color=C_CARD, corner_radius=0, height=52)
         header.pack(fill="x", side="top")
         header.pack_propagate(False)
 
@@ -1199,66 +1198,49 @@ class App(ctk.CTk):
         if PIL_OK:
             try:
                 _pil = Image.open(LOGO_PATH)
-                logo_img = ctk.CTkImage(light_image=_pil, dark_image=_pil, size=(40, 40))
+                logo_img = ctk.CTkImage(light_image=_pil, dark_image=_pil, size=(32, 32))
                 self._logo_img = logo_img
             except Exception:
                 logo_img = None
         if logo_img is not None:
             ctk.CTkLabel(header, text="", image=logo_img).pack(
-                side="left", padx=(18, 10), pady=14
+                side="left", padx=(18, 8), pady=10
             )
-        else:
-            ctk.CTkLabel(
-                header, text="FR", width=40, height=40,
-                font=ctk.CTkFont(size=15, weight="bold"),
-                fg_color=C_TEAL, text_color="#FFFFFF", corner_radius=8,
-            ).pack(side="left", padx=(18, 10), pady=14)
 
-        title_box = ctk.CTkFrame(header, fg_color="transparent")
-        title_box.pack(side="left", pady=14)
         ctk.CTkLabel(
-            title_box, text="ForceRm", anchor="w",
-            font=ctk.CTkFont(size=19, weight="bold"), text_color=C_TXT,
-        ).pack(anchor="w")
-        ctk.CTkLabel(
-            title_box, text="直接删除 · 不可恢复", anchor="w",
-            font=ctk.CTkFont(size=11), text_color=C_SUB,
-        ).pack(anchor="w")
+            header, text="ForceRm", anchor="w",
+            font=ctk.CTkFont(size=15, weight="bold"), text_color=C_TXT,
+        ).pack(side="left")
 
         self.elevate_btn = ctk.CTkButton(
-            header, text="以管理员身份重启", width=132, height=32,
+            header, text="以管理员身份重启", width=124, height=30,
             fg_color="transparent", border_width=1, border_color=C_BORDER,
-            text_color=C_TXT, hover_color="#EEF3F6", corner_radius=8,
+            text_color=C_TXT, hover_color=C_HOVER, corner_radius=6,
             command=self._on_elevate_now,
         )
-        self.elevate_btn.pack(side="right", padx=(8, 18), pady=18)
+        self.elevate_btn.pack(side="right", padx=(8, 18))
 
         self.admin_lbl = ctk.CTkLabel(
             header, text="", font=ctk.CTkFont(size=12), text_color=C_SUB,
         )
-        self.admin_lbl.pack(side="right", padx=4, pady=18)
+        self.admin_lbl.pack(side="right", padx=4)
 
-        # ===== 主体：左侧导航 + 右侧内容 =====
+        # 主体
         body = ctk.CTkFrame(self, fg_color="transparent")
         body.pack(fill="both", expand=True, padx=14, pady=12)
 
-        # --- 侧边导航 ---
-        sidebar = ctk.CTkFrame(body, fg_color=C_CARD, corner_radius=12, width=168)
+        sidebar = ctk.CTkFrame(body, fg_color=C_CARD, corner_radius=8, width=152)
         sidebar.pack(side="left", fill="y", padx=(0, 12))
         sidebar.pack_propagate(False)
-
-        ctk.CTkLabel(
-            sidebar, text="清理范围", anchor="w",
-            font=ctk.CTkFont(size=11), text_color=C_SUB,
-        ).pack(fill="x", padx=16, pady=(16, 6))
+        ctk.CTkFrame(sidebar, fg_color="transparent", height=10).pack()
 
         self.category_filter = "全部项目"
         self.nav_buttons = {}
         for name in ["全部项目", "软件垃圾", "系统垃圾", "深度清理"]:
             b = ctk.CTkButton(
                 sidebar, text=name, anchor="w", height=38,
-                fg_color="transparent", text_color=C_TXT, hover_color="#EEF3F6",
-                corner_radius=8, font=ctk.CTkFont(size=13),
+                fg_color="transparent", text_color=C_TXT, hover_color=C_HOVER,
+                corner_radius=6, font=ctk.CTkFont(size=13),
                 command=lambda n=name: self._set_category(n),
             )
             b.pack(fill="x", padx=10, pady=2)
@@ -1272,34 +1254,29 @@ class App(ctk.CTk):
         ctk.CTkCheckBox(
             side_bottom, text="自动提权", variable=self.auto_elevate_var,
             font=ctk.CTkFont(size=12), text_color=C_TXT,
-            fg_color=C_TEAL, hover_color=C_TEAL_D,
-            checkbox_width=18, checkbox_height=18, corner_radius=5,
+            fg_color=C_ACCENT, hover_color=C_ACCENT_D,
+            checkbox_width=18, checkbox_height=18, corner_radius=4,
             command=self._on_auto_elevate_toggle,
-        ).pack(anchor="w", pady=(0, 6))
-        ctk.CTkLabel(
-            side_bottom, text="仅清理白名单内缓存", anchor="w",
-            font=ctk.CTkFont(size=10), text_color=C_SUB,
         ).pack(anchor="w")
 
-        # --- 右侧主区（grid：列表可伸缩、底部日志固定）---
+        # 右侧主区
         main = ctk.CTkFrame(body, fg_color="transparent")
         main.pack(side="left", fill="both", expand=True)
         main.grid_columnconfigure(0, weight=1)
         main.grid_rowconfigure(3, weight=1)
 
-        # 状态卡：已选容量 + 扫描 / 清理 + 清理方式
-        status_card = ctk.CTkFrame(main, fg_color=C_CARD, corner_radius=12)
+        status_card = ctk.CTkFrame(main, fg_color=C_CARD, corner_radius=8)
         status_card.grid(row=0, column=0, sticky="ew", pady=(0, 10))
 
         left = ctk.CTkFrame(status_card, fg_color="transparent")
-        left.pack(side="left", fill="both", expand=True, padx=20, pady=16)
+        left.pack(side="left", fill="both", expand=True, padx=20, pady=14)
         ctk.CTkLabel(
-            left, text="已选可清理", anchor="w",
+            left, text="可清理文件", anchor="w",
             font=ctk.CTkFont(size=12), text_color=C_SUB,
         ).pack(anchor="w")
         self.total_lbl = ctk.CTkLabel(
             left, text="0 B", anchor="w",
-            font=ctk.CTkFont(size=32, weight="bold"), text_color=C_TEAL,
+            font=ctk.CTkFont(size=26, weight="bold"), text_color=C_TXT,
         )
         self.total_lbl.pack(anchor="w", pady=(2, 0))
         self.count_lbl = ctk.CTkLabel(
@@ -1309,40 +1286,29 @@ class App(ctk.CTk):
         self.count_lbl.pack(anchor="w")
 
         right = ctk.CTkFrame(status_card, fg_color="transparent")
-        right.pack(side="right", padx=20, pady=16)
-        btn_row = ctk.CTkFrame(right, fg_color="transparent")
-        btn_row.pack(anchor="e")
+        right.pack(side="right", padx=20, pady=14)
         self.scan_btn = ctk.CTkButton(
-            btn_row, text="扫描", width=116, height=40,
+            right, text="扫描", width=108, height=38,
             font=ctk.CTkFont(size=14, weight="bold"),
-            fg_color=C_BLUE, hover_color=C_BLUE_D, corner_radius=10,
+            fg_color=C_ACCENT, hover_color=C_ACCENT_D, corner_radius=8,
             command=self._on_scan,
         )
         self.scan_btn.pack(side="left", padx=(0, 10))
         self.clean_btn = ctk.CTkButton(
-            btn_row, text="清理", width=116, height=40,
+            right, text="清理", width=108, height=38,
             font=ctk.CTkFont(size=14, weight="bold"),
-            fg_color=C_TEAL, hover_color=C_TEAL_D, corner_radius=10,
+            fg_color=C_ACCENT, hover_color=C_ACCENT_D, corner_radius=8,
             command=self._on_clean,
         )
         self.clean_btn.pack(side="left")
 
-        mode_row = ctk.CTkFrame(right, fg_color="transparent")
-        mode_row.pack(anchor="e", pady=(12, 0))
-        ctk.CTkLabel(
-            mode_row, text="清理方式", font=ctk.CTkFont(size=11), text_color=C_SUB,
-        ).pack(side="left", padx=(0, 8))
-        ctk.CTkLabel(
-            mode_row, text="直接删除", font=ctk.CTkFont(size=12), text_color=C_TXT,
-        ).pack(side="left")
-
-        # 搜索 + 计数 + 全选
+        # 搜索与批量勾选
         flt = ctk.CTkFrame(main, fg_color="transparent")
         flt.grid(row=1, column=0, sticky="ew", pady=(0, 8))
         self.filter_var = ctk.StringVar()
         self.filter_entry = ctk.CTkEntry(
-            flt, textvariable=self.filter_var, placeholder_text="搜索清理项目…",
-            height=34, corner_radius=8, border_color=C_BORDER, fg_color=C_CARD,
+            flt, textvariable=self.filter_var, placeholder_text="搜索项目",
+            height=34, corner_radius=6, border_color=C_BORDER, fg_color=C_CARD,
         )
         self.filter_entry.pack(side="left", fill="x", expand=True)
         self.filter_entry.bind("<KeyRelease>", self._apply_filter)
@@ -1354,44 +1320,41 @@ class App(ctk.CTk):
         ctk.CTkButton(
             flt, text="全选", width=52, height=34, fg_color="transparent",
             border_width=1, border_color=C_BORDER, text_color=C_TXT,
-            hover_color="#EEF3F6", corner_radius=8,
+            hover_color=C_HOVER, corner_radius=6,
             command=lambda: self._select_all(True),
         ).pack(side="left", padx=(8, 6))
         ctk.CTkButton(
             flt, text="全不选", width=64, height=34, fg_color="transparent",
             border_width=1, border_color=C_BORDER, text_color=C_TXT,
-            hover_color="#EEF3F6", corner_radius=8,
+            hover_color=C_HOVER, corner_radius=6,
             command=lambda: self._select_all(False),
         ).pack(side="left")
 
-        # 软件垃圾：单一总勾选（固定插槽，便于按分类显隐）
+        # 软件垃圾总勾选
         self.software_keys = [t["key"] for t in JUNK_TARGETS if t.get("category") == "软件垃圾"]
         self.software_master = ctk.BooleanVar(value=False)
         self.software_slot = ctk.CTkFrame(main, fg_color="transparent")
         self.software_slot.grid(row=2, column=0, sticky="ew")
         self.software_master_frame = ctk.CTkFrame(
-            self.software_slot, fg_color=C_CARD, corner_radius=10,
+            self.software_slot, fg_color=C_CARD, corner_radius=8,
             border_width=1, border_color=C_BORDER,
         )
         self.software_master_frame.pack(fill="x", pady=(0, 8))
         ctk.CTkCheckBox(
-            self.software_master_frame,
-            text="软件垃圾   全部常用软件缓存 · 一键勾选",
+            self.software_master_frame, text="软件垃圾",
             variable=self.software_master,
             font=ctk.CTkFont(size=13, weight="bold"), text_color=C_TXT,
-            fg_color=C_TEAL, hover_color=C_TEAL_D,
-            checkbox_width=20, checkbox_height=20, corner_radius=5,
+            fg_color=C_ACCENT, hover_color=C_ACCENT_D,
+            checkbox_width=20, checkbox_height=20, corner_radius=4,
             command=lambda: self._toggle_software(self.software_master.get()),
-        ).pack(side="left", anchor="w", padx=16, pady=12)
+        ).pack(side="left", anchor="w", padx=16, pady=10)
         ctk.CTkLabel(
-            self.software_master_frame, text=f"{len(self.software_keys)} 个软件",
+            self.software_master_frame, text=f"{len(self.software_keys)} 项",
             font=ctk.CTkFont(size=11), text_color=C_SUB,
         ).pack(side="right", padx=16)
 
-        # 可清理项目列表
-        self.scroll = ctk.CTkScrollableFrame(
-            main, fg_color=C_CARD, corner_radius=12,
-        )
+        # 项目列表
+        self.scroll = ctk.CTkScrollableFrame(main, fg_color=C_CARD, corner_radius=8)
         self.scroll.grid(row=3, column=0, sticky="nsew", pady=(0, 8))
 
         for t in JUNK_TARGETS:
@@ -1400,57 +1363,57 @@ class App(ctk.CTk):
             self.results[key] = {"size": 0, "count": 0}
 
             if key in self.software_keys:
-                # 软件项不单独陈列，仅由“软件垃圾”总框统一控制；
-                # 仍保留变量，供扫描统计与清理判定使用。
                 self.check_vars[key].set(self.software_master.get())
                 continue
 
             row = ctk.CTkFrame(self.scroll, fg_color="transparent")
-            row.pack(fill="x", padx=8, pady=2)
+            row.pack(fill="x", padx=8, pady=1)
 
             cb = ctk.CTkCheckBox(
-                row, text=f"{t['name']}   ·   风险{t['risk']}",
-                variable=self.check_vars[key],
+                row, text=t["name"], variable=self.check_vars[key],
                 font=ctk.CTkFont(size=13), text_color=C_TXT,
-                fg_color=C_TEAL, hover_color=C_TEAL_D,
-                checkbox_width=20, checkbox_height=20, corner_radius=5,
+                fg_color=C_ACCENT, hover_color=C_ACCENT_D,
+                checkbox_width=20, checkbox_height=20, corner_radius=4,
                 command=self._update_total,
             )
-            cb.pack(side="left", anchor="w", padx=10, pady=8)
+            cb.pack(side="left", anchor="w", padx=10, pady=7)
 
             size_lbl = ctk.CTkLabel(
                 row, text="未扫描", width=110, anchor="e",
                 font=ctk.CTkFont(size=12), text_color=C_SUB,
             )
-            size_lbl.pack(side="right", padx=12, pady=8)
+            size_lbl.pack(side="right", padx=12, pady=7)
             self.size_labels[key] = size_lbl
             self.rows[key] = row
 
-        # 状态行 + 日志（底部固定）
+        # 状态行与日志
+        status_row = ctk.CTkFrame(main, fg_color="transparent")
+        status_row.grid(row=4, column=0, sticky="ew", padx=6, pady=(0, 4))
         self.status_lbl = ctk.CTkLabel(
-            main, text="就绪", anchor="w",
+            status_row, text="就绪", anchor="w",
             font=ctk.CTkFont(size=12), text_color=C_SUB,
         )
-        self.status_lbl.grid(row=4, column=0, sticky="ew", padx=6, pady=(0, 4))
+        self.status_lbl.pack(side="left")
+        self.progress_bar = ctk.CTkProgressBar(
+            status_row, width=120, height=4, mode="indeterminate",
+            fg_color=C_BORDER, progress_color=C_ACCENT,
+        )
 
         self.log = ctk.CTkTextbox(
-            main, height=104, fg_color=C_CARD, corner_radius=12,
-            border_width=1, border_color=C_BORDER, text_color=C_TXT,
-            font=ctk.CTkFont(size=11),
+            main, height=72, fg_color=C_CARD, corner_radius=8,
+            text_color=C_TXT, font=ctk.CTkFont(size=11),
         )
         self.log.grid(row=5, column=0, sticky="ew")
 
-        # 初始分类（同时完成首次过滤与导航高亮）
         self._set_category("全部项目")
 
         if is_admin():
-            self.admin_lbl.configure(text="管理员", text_color="#2E9E5B")
+            self.admin_lbl.configure(text="管理员", text_color=C_ACCENT)
             self.elevate_btn.configure(state="disabled")
         else:
             self.admin_lbl.configure(text="标准用户")
 
-        self._log("原生引擎：" + ("LibRC.dll" if LibRC is not None else "纯 Python"))
-        self._log("权限：" + ("管理员" if is_admin() else "标准用户"))
+        self._log("引擎：" + ("LibRC.dll" if LibRC is not None else "纯 Python"))
 
     def _on_auto_elevate_toggle(self):
         s = load_settings()
@@ -1476,7 +1439,7 @@ class App(ctk.CTk):
         self.category_filter = name
         for n, b in getattr(self, "nav_buttons", {}).items():
             if n == name:
-                b.configure(fg_color="#E8F3F7", text_color=C_TEAL,
+                b.configure(fg_color=C_HOVER, text_color=C_ACCENT,
                             font=ctk.CTkFont(size=13, weight="bold"))
             else:
                 b.configure(fg_color="transparent", text_color=C_TXT,
@@ -1526,37 +1489,38 @@ class App(ctk.CTk):
         self.log.insert("end", f"[{ts}] {msg}\n")
         self.log.see("end")
 
-    # ------------------------- 加载动画 -------------------------
+    # ------------------------- 进度指示 -------------------------
     def _start_spinner(self, text: str):
-        """在状态行显示 text + 旋转图标。"""
+        """显示状态文字并启动控件进度条。"""
         self._stop_spinner()
         self._spin_text = text
-        self._spin_i = 0
-        self._tick_spinner()
-
-    def _tick_spinner(self):
-        frame = SPIN_FRAMES[self._spin_i % len(SPIN_FRAMES)]
-        self._spin_i += 1
-        self.status_lbl.configure(text=f"{self._spin_text}  {frame}")
-        self._spin_job = self.after(SPIN_INTERVAL_MS, self._tick_spinner)
+        self._spin_active = True
+        self.status_lbl.configure(text=text)
+        bar = getattr(self, "progress_bar", None)
+        if bar is not None:
+            bar.pack(side="right", padx=(8, 0))
+            bar.start()
 
     def _stop_spinner(self, final_text: str = None):
-        """停止动画；传入 final_text 则更新为最终状态。"""
-        if self._spin_job is not None:
+        """停止进度条；传入 final_text 时更新最终状态。"""
+        bar = getattr(self, "progress_bar", None)
+        if bar is not None:
             try:
-                self.after_cancel(self._spin_job)
+                bar.stop()
+                bar.pack_forget()
             except Exception:
                 pass
-            self._spin_job = None
+        self._spin_active = False
         if final_text is not None:
             self.status_lbl.configure(text=final_text)
 
     def _set_progress(self, text: str):
-        """更新动画文字但不重启计时器（用于并行任务的进度刷新）。"""
-        if self._spin_job is None:
+        """刷新状态文字，不重启进度条。"""
+        if not getattr(self, "_spin_active", False):
             self._start_spinner(text)
         else:
             self._spin_text = text
+            self.status_lbl.configure(text=text)
 
     def _update_total(self):
         total = 0
@@ -1635,7 +1599,8 @@ class App(ctk.CTk):
         self.scan_btn.configure(state="disabled")
         self.clean_btn.configure(state="disabled")
         n = worker_count()
-        self._log(f"开始扫描（{n} 线程）……")
+        self._log(f"开始扫描（{n} 线程）")
+        self._set_progress("正在扫描")
 
         def worker():
             with ThreadPoolExecutor(max_workers=n) as ex:
@@ -1663,7 +1628,7 @@ class App(ctk.CTk):
         if t.get("type") == "action":
             if r["size"] > 0:
                 self.size_labels[key].configure(
-                    text=f"{human_size(r['size'])} · {r['count']}个"
+                    text=human_size(r["size"])
                 )
             else:
                 self.size_labels[key].configure(text="可执行")
@@ -1673,9 +1638,9 @@ class App(ctk.CTk):
             self.size_labels[key].configure(text="无文件")
         else:
             self.size_labels[key].configure(
-                text=f"{human_size(r['size'])} · {r['count']}个"
+                text=human_size(r["size"])
             )
-            self._log(f"[{t['name']}] {human_size(r['size'])}")
+            self._log(f"{t['name']}  {human_size(r['size'])}")
         self._update_total()
 
     def _finish_scan(self):
@@ -1683,6 +1648,7 @@ class App(ctk.CTk):
         self.scan_btn.configure(state="normal")
         self.clean_btn.configure(state="normal")
         self._log("扫描完成")
+        self._stop_spinner("扫描完成")
 
     # ------------------------- 清理 -------------------------
     def _on_clean(self):
@@ -1703,7 +1669,7 @@ class App(ctk.CTk):
         ans = mb.askyesno(
             "确认清理",
             f"即将清理 {count} 个文件，约 {human_size(total)}。\n"
-            f"方式：{mode}（不可恢复）\n\n确定继续吗？",
+            "直接删除，不可恢复。\n\n确定继续吗？",
         )
         if not ans:
             self._log("已取消清理。")
@@ -1712,7 +1678,7 @@ class App(ctk.CTk):
         self.working = True
         self.scan_btn.configure(state="disabled")
         self.clean_btn.configure(state="disabled")
-        self._log(f"开始清理（{mode}）……")
+        self._log(f"开始清理（{mode}）")
 
         try:
             is_admin = bool(ctypes.windll.shell32.IsUserAnAdmin())
@@ -1722,7 +1688,7 @@ class App(ctk.CTk):
             self._log("未以管理员运行，强制删除可能受限")
 
         nw = worker_count()
-        self._log(f"开始清理（{mode}，{nw} 线程）……")
+        self._log(f"清理线程：{nw}")
 
         def worker():
             freed = 0
