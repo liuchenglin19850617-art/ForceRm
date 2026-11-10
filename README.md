@@ -1,4 +1,4 @@
-# ForceRm
+# ForceRm - v2.0.5
 
 Windows 垃圾清理工具，基于 Python 与 CustomTkinter 构建图形界面。仅清理白名单内的缓存与临时文件，不涉及注册表与使用痕迹。
 
@@ -32,12 +32,22 @@ DISM 组件存储清理仅在 build 9200（Windows 8 / Server 2012）及以上�
 
 直接删除，不可恢复，程序不提供回收站模式。使用「全选」将同时启用 `C:\Windows.old` 整目录、事件日志、清空回收站、DISM 组件清理等不可逆项目。
 
+## 单文件发行
+
+发行包采用 PyInstaller `--onefile` 构建。每个可执行文件自包含 Python 运行时、customtkinter、Pillow、`LibRm/LibRm.json` 与 `logo.png`，不再附带 `_internal` 目录。与旧版 onedir 相比，发行包由 1112 个文件缩减为 4 个文件（两个可执行文件、`README.md`、`LICENSE`），解压后不依赖同目录下的运行时文件。两个可执行文件各含一份完整的运行时，发行包体积高于旧版共用一份运行时的结构。
+
+只读资源在运行时解压至临时目录，由 `sys._MEIPASS` 定位；`config.json`、`WinERR.log` 与自检报告仍写入可执行文件所在目录。程序启动时需要先完成一次运行时解压，因此冷启动时间长于 onedir 版本。
+
+程序优先读取可执行文件同目录下的 `LibRm/LibRm.json` 与 `logo.png`；未找到时再读取内嵌副本。规则库与图标可在不重新构建的情况下替换。
+
 ## 文件
 
 - `ForceRm.pyw` / `ForceRm-high.pyw`：主程序；high 版另含被占用文件的解锁重试逻辑。
-- `LibRm/LibRm.json`：合并后的规则库，结构为 `{"version":1,"count":238,"targets":[...]}`。该文件缺失或损坏时，加载器回退兼容旧版单软件散文件。
-- `logo.png` / `config.json`：图标与配置，`auto_elevate` 控制是否自动申请管理员权限。
-- `dist-full-v1.0.2.zip`：免安装发行包，解压后运行对应 exe 即可。
+- `ForceRm.exe` / `ForceRm-high.exe`：单文件可执行程序，运行时与只读资源已内嵌。
+- `LibRm/LibRm.json`：源码仓库中的合并规则库，结构为 `{"version":1,"count":238,"targets":[...]}`。发行版将其内嵌于 exe；该文件缺失或损坏时，加载器回退兼容旧版单软件散文件。
+- `logo.png`：品牌图标，构建时生成 `ForceRm.ico` 并内嵌于 exe。
+- `config.json`：运行时在可执行文件同目录生成，`auto_elevate` 控制是否自动申请管理员权限，`threads` 控制并发线程数。
+- `dist-full-v1.0.2.zip`：免安装发行包，含两个单文件 exe、`README.md` 与 `LICENSE`。
 - `GITHUB/`：发布用源码副本。
 - `LICENSE`：GNU AGPL v3.0 全文。
 
