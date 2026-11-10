@@ -16,6 +16,7 @@ ForceRm 清理工具
   4. 自动跳过被占用（正在使用）的文件，不中断整体流程。
   5. 不跟随符号链接 / 目录 junctions，避免误删其它盘的数据。
   6. 无法删除的文件：先尝试管理员提权强制删除，仍失败则跳过并在同级目录写 WinERR.log。
+  7. 清理项按 Windows 版本（WinXP 至 Win11）启用，不适用于当前版本的规则不显示。
 
 运行依赖：Python 3.10+ 与 customtkinter
     pip install customtkinter
@@ -32,6 +33,10 @@ import threading
 import subprocess
 import datetime
 import tkinter.messagebox as mb
+try:
+    import winreg
+except ImportError:
+    winreg = None
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
@@ -111,6 +116,146 @@ def worker_count() -> int:
 
 
 # --------------------------------------------------------------------------
+# Windows 版本识别（WinXP 至 Win11，含同内核 Server 版本）
+# --------------------------------------------------------------------------
+def windows_version() -> dict:
+    """识别当前 Windows 版本，返回供清理策略使用的结构化信息。"""
+    info = {
+        "major": 0, "minor": 0, "build": 0, "ubr": 0,
+        "product": "", "display": "", "edition": "", "install_type": "",
+        "family": "Unknown", "label": "Windows", "full": "", "is_server": False,
+        "supports_dism": False, "supports_do": False,
+    }
+    try:
+        v = sys.getwindowsversion()
+        info["major"] = int(v.major)
+        info["minor"] = int(v.minor)
+        info["build"] = int(v.build)
+    except Exception:
+        pass
+    if winreg is not None:
+        try:
+            flags = winreg.KEY_READ | getattr(winreg, "KEY_WOW64_64KEY", 0)
+            with winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                r"SOFTWARE\Microsoft\Windows NT\CurrentVersion", 0, flags,
+            ) as key:
+                def _read(name, default=""):
+                    try:
+                        return str(winreg.QueryValueEx(key, name)[0])
+                    except OSError:
+                        return default
+
+                info["product"] = _read("ProductName")
+                info["display"] = _read("DisplayVersion") or _read("ReleaseId")
+                info["edition"] = _read("EditionID")
+                info["install_type"] = _read("InstallationType")
+                cb = _read("CurrentBuildNumber") or _read("CurrentBuild")
+                if cb.isdigit():
+                    info["build"] = int(cb)
+                ubr = _read("UBR")
+                if ubr.isdigit():
+                    info["ubr"] = int(ubr)
+        except Exception:
+            pass
+
+    joined = " ".join((info["product"], info["edition"], info["install_type"])).lower()
+    info["is_server"] = ("server" in joined
+                         or info["install_type"].lower() == "server")
+
+    major, minor, build = info["major"], info["minor"], info["build"]
+    if major == 5 and minor in (1, 2):
+        family = "XP"
+    elif (major, minor) == (6, 0):
+        family = "Vista"
+    elif (major, minor) == (6, 1):
+        family = "7"
+    elif (major, minor) == (6, 2):
+        family = "8"
+    elif (major, minor) == (6, 3):
+        family = "8.1"
+    elif major == 10 and build >= 22000:
+        family = "11"
+    elif major == 10:
+        family = "10"
+    elif major > 10:
+        family = "11"
+    else:
+        family = "Unknown"
+    info["family"] = family
+    info["supports_dism"] = build >= 9200
+    info["supports_do"] = build >= 10240
+
+    if info["is_server"]:
+        server_tag = {
+            3790: "2003", 6001: "2008", 6002: "2008", 7601: "2008 R2",
+            9200: "2012", 9600: "2012 R2", 14393: "2016",
+            17763: "2019", 20348: "2022", 26100: "2025",
+        }.get(build, "")
+        info["label"] = "Windows Server" + (" " + server_tag if server_tag else "")
+    else:
+        info["label"] = "Windows " + family
+        if info["display"] and family in ("10", "11"):
+            info["label"] += " " + info["display"]
+    if info["build"] > 0:
+        info["full"] = "%s (%d.%d)" % (info["label"], info["build"], info["ubr"])
+    else:
+        info["full"] = info["label"]
+    return info
+
+
+VERSION_PROFILES = (
+    ("XP / 2003", 2600, 5999, "Documents and Settings 结构，IE 缓存与事件日志使用 XP 路径"),
+    ("Vista / 2008", 6000, 7599, "AppData 与 ProgramData 结构，安装日志位于 Panther"),
+    ("7 / 2008 R2", 7600, 9199, "沿用 AppData 结构，不启用 DISM 组件清理"),
+    ("8 / 8.1", 9200, 10239, "启用 DISM 组件清理、睡眠研究与实时内核报告"),
+    ("10", 10240, 21999, "启用传递优化缓存与升级助手残留"),
+    ("11", 22000, 999999, "继承 10 的规则组，追加度量启动日志目录"),
+)
+
+
+def version_allows(target: dict, win: dict) -> bool:
+    """按 build 区间与版本族判断某条规则是否适用于当前系统。"""
+    build = int(win.get("build", 0) or 0)
+    if build <= 0:
+        return True
+    low = int(target.get("min_build", 0) or 0)
+    high = int(target.get("max_build", 0) or 0)
+    if low and build < low:
+        return False
+    if high and build > high:
+        return False
+    families = target.get("families")
+    if families and win.get("family") not in families:
+        return False
+    if target.get("server_only") and not win.get("is_server"):
+        return False
+    if target.get("client_only") and win.get("is_server"):
+        return False
+    return True
+
+
+def apply_version_policy(targets: list, win: dict) -> list:
+    """按版本过滤规则，并改写 XP 与 Win11 的专属路径。"""
+    build = int(win.get("build", 0) or 0)
+    out = []
+    for target in targets:
+        if not version_allows(target, win):
+            continue
+        key = target.get("key", "")
+        if 0 < build < 6000 and key == "event_logs":
+            target["paths"] = [os.path.join(WINDIR, "system32", "config")]
+            target["patterns"] = ["*.evt"]
+            target["name"] = "事件日志 (XP)"
+        if build >= 22000 and key == "system_logs":
+            extra = os.path.join(WINDIR, "Logs", "MeasuredBoot")
+            if extra not in target.get("paths", []):
+                target["paths"] = list(target.get("paths", [])) + [extra]
+        out.append(target)
+    return out
+
+
+# --------------------------------------------------------------------------
 # 工具函数
 # --------------------------------------------------------------------------
 def human_size(num: int) -> str:
@@ -142,11 +287,27 @@ def is_link(path: str) -> bool:
 # --------------------------------------------------------------------------
 # 安全清理目标（白名单：系统 / 浏览器 / 通用）
 # --------------------------------------------------------------------------
-LOCAL = os.environ.get("LOCALAPPDATA", "")
-ROAMING = os.environ.get("APPDATA", "")
-PROGRAMDATA = os.environ.get("ProgramData", r"C:\ProgramData")
-TEMP = os.environ.get("TEMP", "") or os.environ.get("TMP", "")
 USERPROFILE = os.environ.get("USERPROFILE", os.path.expanduser("~"))
+WINDIR = os.environ.get("WINDIR", "") or os.path.join(
+    os.environ.get("SystemDrive", "C:"), "Windows")
+WIN = windows_version()
+
+if 0 < WIN["build"] < 6000:
+    LOCAL = os.environ.get("LOCALAPPDATA", "") or os.path.join(
+        USERPROFILE, "Local Settings", "Application Data")
+    ROAMING = os.environ.get("APPDATA", "") or os.path.join(
+        USERPROFILE, "Application Data")
+    PROGRAMDATA = os.environ.get("ProgramData", "") or os.path.join(
+        os.path.dirname(USERPROFILE), "All Users", "Application Data")
+else:
+    LOCAL = os.environ.get("LOCALAPPDATA", "") or os.path.join(
+        USERPROFILE, "AppData", "Local")
+    ROAMING = os.environ.get("APPDATA", "") or os.path.join(
+        USERPROFILE, "AppData", "Roaming")
+    PROGRAMDATA = os.environ.get("ProgramData", "") or r"C:\ProgramData"
+
+TEMP = (os.environ.get("TEMP", "") or os.environ.get("TMP", "")
+        or os.path.join(LOCAL, "Temp"))
 
 # --------------------------------------------------------------------------
 # 智能软件缓存识别：目录关键字 + 一次遍历，不依赖静态软件名库
@@ -417,6 +578,7 @@ JUNK_TARGETS = [
         "desc": "Explorer 缩略图数据库 (*.db)",
         "paths": [os.path.join(LOCAL, "Microsoft", "Windows", "Explorer")],
         "patterns": ["thumbcache_*.db", "iconcache_*.db"],
+        "min_build": 6000,
         "risk": "低",
         "default": True,
     },
@@ -436,6 +598,7 @@ JUNK_TARGETS = [
     },
     {
         "key": "edge_cache",
+        "min_build": 10240,
         "name": "Edge 浏览器缓存",
         "desc": "Microsoft Edge 的缓存与代码缓存",
         "paths": [
@@ -460,6 +623,7 @@ JUNK_TARGETS = [
     },
     {
         "key": "crash_dumps",
+        "min_build": 6000,
         "name": "崩溃转储 / 错误报告",
         "desc": "CrashDumps 与 WER 错误报告数据",
         "paths": [
@@ -509,6 +673,7 @@ DEEP_ACTIONS = [
     },
     {
         "key": "act_dism_cleanup", "type": "action", "action": "dism_cleanup",
+        "min_build": 9200,
         "name": "组件存储清理 (WinSxS)",
         "desc": "DISM StartComponentCleanup，清理旧组件版本（耗时较长）",
         "risk": "中", "default": False, "deep": True,
@@ -522,6 +687,73 @@ DEEP_ACTIONS = [
 
 JUNK_TARGETS += DEEP_ACTIONS
 JUNK_TARGETS.append(SMART_TARGET)
+
+# 规则库中的系统项按版本启用，不修改单文件规则库本身
+VERSION_KEY_RULES = {
+    "inet_cache": {"min_build": 6000},
+    "defender_history": {"min_build": 6000},
+    "font_cache": {"min_build": 6000},
+    "wer_user": {"min_build": 6000},
+    "system_logs": {"min_build": 6000},
+    "system_misc_cache": {"min_build": 6000},
+    "windows_old": {"min_build": 6000},
+    "windows_update_leftover": {"min_build": 6000},
+    "delivery_optimization": {"min_build": 10240},
+}
+
+# 版本专属清理项：路径与通用规则不重叠，按 build 区间启用
+VERSION_RULES = [
+    {
+        "key": "ver_xp_ie_cache", "min_build": 2600, "max_build": 5999,
+        "name": "IE 脱机缓存 (XP)", "desc": "Temporary Internet Files",
+        "paths": [os.path.join(USERPROFILE, "Local Settings",
+                               "Temporary Internet Files")],
+        "patterns": ["*"], "risk": "低", "default": True,
+    },
+    {
+        "key": "ver_xp_downloaded", "min_build": 2600, "max_build": 5999,
+        "name": "下载的程序文件 (XP)", "desc": "Downloaded Program Files",
+        "paths": [os.path.join(WINDIR, "Downloaded Program Files")],
+        "patterns": ["*"], "risk": "中", "default": False,
+    },
+    {
+        "key": "ver_xp_errorrep", "min_build": 2600, "max_build": 5999,
+        "name": "错误报告转储 (XP)", "desc": "PCHealth ERRORREP UserDumps",
+        "paths": [os.path.join(WINDIR, "PCHealth", "ERRORREP", "UserDumps")],
+        "patterns": ["*"], "risk": "低", "default": False,
+    },
+    {
+        "key": "ver_vista_panther", "min_build": 6000, "max_build": 9199,
+        "name": "安装与升级日志", "desc": "Windows Panther",
+        "paths": [os.path.join(WINDIR, "Panther")],
+        "patterns": ["*"], "risk": "低", "default": False,
+    },
+    {
+        "key": "ver_win8_sleepstudy", "min_build": 9200,
+        "name": "睡眠研究报告", "desc": "System32 SleepStudy",
+        "paths": [os.path.join(WINDIR, "System32", "SleepStudy")],
+        "patterns": ["*"], "risk": "低", "default": False,
+    },
+    {
+        "key": "ver_win8_livekernel", "min_build": 9200,
+        "name": "实时内核报告", "desc": "Windows LiveKernelReports",
+        "paths": [os.path.join(WINDIR, "LiveKernelReports")],
+        "patterns": ["*"], "risk": "低", "default": False,
+    },
+    {
+        "key": "ver_win10_upgrade", "min_build": 10240,
+        "name": "升级助手残留", "desc": "Windows10Upgrade 与 UpdateAssistant",
+        "paths": [r"C:\Windows10Upgrade", os.path.join(WINDIR, "UpdateAssistant")],
+        "patterns": ["*"], "risk": "低", "default": False,
+    },
+]
+
+for _target in JUNK_TARGETS:
+    _constraint = VERSION_KEY_RULES.get(_target.get("key", ""))
+    if _constraint:
+        _target.update(_constraint)
+JUNK_TARGETS += VERSION_RULES
+JUNK_TARGETS = apply_version_policy(JUNK_TARGETS, WIN)
 
 # 深度清理项排到列表末尾（sort 稳定，保持相对顺序）
 JUNK_TARGETS.sort(key=lambda t: 1 if (t.get("deep") or t.get("type") == "action") else 0)
@@ -875,6 +1107,8 @@ def run_deep_action(name: str):
     if name == "empty_recycle":
         return empty_recycle_bin()
     if name == "dism_cleanup":
+        if not WIN["supports_dism"]:
+            return (False, "当前 Windows 版本不支持组件存储清理")
         return dism_component_cleanup()
     if name == "flush_dns":
         return flush_dns()
@@ -992,6 +1226,10 @@ class App(ctk.CTk):
             header, text="ForceRm", anchor="w",
             font=ctk.CTkFont(size=15, weight="bold"), text_color=C_TXT,
         ).pack(side="left")
+        ctk.CTkLabel(
+            header, text=WIN["full"], anchor="w",
+            font=ctk.CTkFont(size=11), text_color=C_SUB,
+        ).pack(side="left", padx=(10, 0))
 
         self.elevate_btn = ctk.CTkButton(
             header, text="以管理员身份重启", width=124, height=30,
@@ -1240,6 +1478,8 @@ class App(ctk.CTk):
                 # 软件垃圾项不单独陈列，仅由总框显示
                 continue
             row.pack_forget()
+            if not version_allows(t, WIN):
+                continue
             if cat == "软件垃圾" and t.get("type") != "smart":
                 continue
             if cat == "系统垃圾" and key in self.software_keys:
@@ -1623,6 +1863,15 @@ if __name__ == "__main__":
             "smart": any(t.get("type") == "smart" for t in JUNK_TARGETS),
             "frm_lib": sum(1 for t in JUNK_TARGETS if t["key"].startswith("frm_lib_")),
             "smart_files": len(smart_collect()),
+            "win_version": WIN["label"],
+            "win_family": WIN["family"],
+            "win_build": WIN["build"],
+            "win_ubr": WIN["ubr"],
+            "win_version_full": WIN["full"],
+            "win_server": WIN["is_server"],
+            "win_dism": WIN["supports_dism"],
+            "version_rules": sum(1 for t in JUNK_TARGETS
+                                 if t["key"].startswith("ver_")),
         }
         with open(os.path.join(APP_DIR, "_selftest.json"), "w", encoding="utf-8") as _fh:
             json.dump(_out, _fh, ensure_ascii=False, indent=2)
