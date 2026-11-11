@@ -21,6 +21,7 @@ ForceRm 清理工具
 运行依赖：Python 3.10+ 与 customtkinter
     pip install customtkinter
 双击 .pyw 即可运行（无控制台窗口）。
+发行包采用 PyInstaller onefile，规则库与图标内嵌于可执行文件。
 """
 
 import os
@@ -90,7 +91,17 @@ def _resource_dir() -> str:
 
 
 APP_DIR = _resource_dir()
+
+
+def _bundle_dir() -> str:
+    """冻结后的只读资源目录；onefile 模式下为 sys._MEIPASS。"""
+    return getattr(sys, "_MEIPASS", "") or APP_DIR
+
+
+BUNDLE_DIR = _bundle_dir()
 LOGO_PATH = os.path.join(APP_DIR, "logo.png")
+if not os.path.isfile(LOGO_PATH):
+    LOGO_PATH = os.path.join(BUNDLE_DIR, "logo.png")
 
 # 进度指示使用控件条，不使用字符动画
 
@@ -658,7 +669,11 @@ JUNK_TARGETS = [
 # 从 LibRC 目录加载各类软件的独立 .json 定义
 LIBRM_DIR = os.path.join(APP_DIR, "LibRm")
 if not os.path.isdir(LIBRM_DIR):
-    LIBRM_DIR = os.path.join(APP_DIR, "LibRC")
+    _bundled_lib = os.path.join(BUNDLE_DIR, "LibRm")
+    if os.path.isdir(_bundled_lib):
+        LIBRM_DIR = _bundled_lib
+    elif os.path.isdir(os.path.join(APP_DIR, "LibRC")):
+        LIBRM_DIR = os.path.join(APP_DIR, "LibRC")
 LIBRC_DIR = LIBRM_DIR
 JUNK_TARGETS += load_software_targets(LIBRM_DIR)
 
@@ -1113,6 +1128,389 @@ def run_deep_action(name: str):
     if name == "flush_dns":
         return flush_dns()
     return (False, "未知动作")
+
+
+# --------------------------------------------------------------------------
+# 进程疏通（隐藏参数 --procuninst）
+# --------------------------------------------------------------------------
+PROC_WHITELIST = {
+    "system", "system idle process", "registry", "memory compression",
+    "smss.exe", "csrss.exe", "wininit.exe", "winlogon.exe", "services.exe",
+    "lsass.exe", "svchost.exe", "fontdrvhost.exe", "dwm.exe", "audiodg.exe",
+    "conhost.exe", "wudfhost.exe", "spoolsv.exe", "searchindexer.exe",
+    "searchhost.exe", "securityhealthservice.exe", "securityhealthsystray.exe",
+    "msmpeng.exe", "nissrv.exe", "mpdefendercoreservice.exe", "ctfmon.exe",
+    "explorer.exe", "shellexperiencehost.exe", "startmenuexperiencehost.exe",
+    "runtimebroker.exe", "applicationframehost.exe", "taskhostw.exe",
+    "sihost.exe", "textinputhost.exe", "lockapp.exe", "widgets.exe",
+    "phoneexperiencehost.exe", "taskmgr.exe", "trustedinstaller.exe",
+    "tiworker.exe", "dism.exe", "cleanmgr.exe", "wuauclt.exe",
+    "forcerm.exe", "forcerm-high.exe", "python.exe", "pythonw.exe",
+    "procuninst.exe", "java.exe", "javaw.exe",
+}
+PROC_CPU_DEFAULT = 0.50
+PROC_MEM_DEFAULT = 768
+PROC_SAMPLE_SECS = 0.8
+
+try:
+    _K32 = ctypes.windll.kernel32
+    _PSAPI = ctypes.windll.psapi
+except Exception:
+    _K32 = _PSAPI = None
+
+
+class _PROC_PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", ctypes.c_uint32),
+        ("cntUsage", ctypes.c_uint32),
+        ("th32ProcessID", ctypes.c_uint32),
+        ("th32DefaultHeapID", ctypes.c_void_p),
+        ("th32ModuleID", ctypes.c_uint32),
+        ("cntThreads", ctypes.c_uint32),
+        ("th32ParentProcessID", ctypes.c_uint32),
+        ("pcPriClassBase", ctypes.c_long),
+        ("dwFlags", ctypes.c_uint32),
+        ("szExeFile", ctypes.c_wchar * 260),
+    ]
+
+
+class _PROC_MEMORY_COUNTERS(ctypes.Structure):
+    _fields_ = [
+        ("cb", ctypes.c_uint32), ("PageFaultCount", ctypes.c_uint32),
+        ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+        ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t),
+    ]
+
+
+class _PROC_FILETIME(ctypes.Structure):
+    _fields_ = [("dwLowDateTime", ctypes.c_uint32),
+                ("dwHighDateTime", ctypes.c_uint32)]
+
+
+def _proc_open(pid, access):
+    if _K32 is None:
+        return None
+    _K32.OpenProcess.argtypes = (ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32)
+    _K32.OpenProcess.restype = ctypes.c_void_p
+    return _K32.OpenProcess(access, 0, pid)
+
+
+def _proc_snapshot():
+    out = {}
+    if _K32 is None:
+        return out
+    _K32.CreateToolhelp32Snapshot.argtypes = (ctypes.c_uint32, ctypes.c_uint32)
+    _K32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+    snap = _K32.CreateToolhelp32Snapshot(0x00000002, 0)
+    if not snap or snap == ctypes.c_void_p(-1).value:
+        return out
+    try:
+        entry = _PROC_PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(entry)
+        _K32.Process32FirstW.argtypes = (
+            ctypes.c_void_p, ctypes.POINTER(_PROC_PROCESSENTRY32W))
+        _K32.Process32FirstW.restype = ctypes.c_int
+        _K32.Process32NextW.argtypes = (
+            ctypes.c_void_p, ctypes.POINTER(_PROC_PROCESSENTRY32W))
+        _K32.Process32NextW.restype = ctypes.c_int
+        ok = _K32.Process32FirstW(snap, ctypes.byref(entry))
+        while ok:
+            out[entry.th32ProcessID] = {
+                "name": entry.szExeFile,
+                "ppid": entry.th32ParentProcessID,
+            }
+            ok = _K32.Process32NextW(snap, ctypes.byref(entry))
+    finally:
+        _K32.CloseHandle.argtypes = (ctypes.c_void_p,)
+        _K32.CloseHandle(snap)
+    return out
+
+
+def _proc_cpu_ticks(pid):
+    h = _proc_open(pid, 0x1000)
+    if not h:
+        return 0
+    try:
+        create = _PROC_FILETIME()
+        exit_ft = _PROC_FILETIME()
+        kernel = _PROC_FILETIME()
+        user = _PROC_FILETIME()
+        _K32.GetProcessTimes.argtypes = (
+            ctypes.c_void_p, ctypes.POINTER(_PROC_FILETIME),
+            ctypes.POINTER(_PROC_FILETIME), ctypes.POINTER(_PROC_FILETIME),
+            ctypes.POINTER(_PROC_FILETIME))
+        _K32.GetProcessTimes.restype = ctypes.c_int
+        if not _K32.GetProcessTimes(
+                h, ctypes.byref(create), ctypes.byref(exit_ft),
+                ctypes.byref(kernel), ctypes.byref(user)):
+            return 0
+        return (((kernel.dwHighDateTime << 32) | kernel.dwLowDateTime)
+                + ((user.dwHighDateTime << 32) | user.dwLowDateTime))
+    finally:
+        _K32.CloseHandle(h)
+
+
+def _proc_details(pid):
+    h = _proc_open(pid, 0x1000)
+    if not h:
+        return "", 0
+    try:
+        _K32.QueryFullProcessImageNameW.argtypes = (
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_uint32))
+        buf = ctypes.create_unicode_buffer(1024)
+        size = ctypes.c_uint32(1024)
+        path = ""
+        if _K32.QueryFullProcessImageNameW(
+                h, 0, ctypes.cast(buf, ctypes.c_void_p), ctypes.byref(size)):
+            path = buf.value
+        mem = 0
+        if _PSAPI is not None:
+            pmc = _PROC_MEMORY_COUNTERS()
+            pmc.cb = ctypes.sizeof(pmc)
+            _PSAPI.GetProcessMemoryInfo.argtypes = (
+                ctypes.c_void_p, ctypes.POINTER(_PROC_MEMORY_COUNTERS),
+                ctypes.c_uint32)
+            if _PSAPI.GetProcessMemoryInfo(h, ctypes.byref(pmc), pmc.cb):
+                mem = int(pmc.WorkingSetSize)
+        return path, mem
+    finally:
+        _K32.CloseHandle(h)
+
+
+def _proc_protected(pid, name, path, ppid, self_pid, self_ppid):
+    if pid in (0, 4) or pid == self_pid or pid == self_ppid:
+        return "必要进程"
+    if name.lower() in PROC_WHITELIST:
+        return "必要程序"
+    if path:
+        low = os.path.normcase(path)
+        for sub in ("System32", "SysWOW64", "WinSxS"):
+            root = os.path.normcase(os.path.join(WINDIR, sub)) + os.sep
+            if low.startswith(root):
+                return "系统目录"
+    return ""
+
+
+def _proc_terminate(pid):
+    h = _proc_open(pid, 0x0001)
+    if not h:
+        return False
+    try:
+        _K32.TerminateProcess.argtypes = (ctypes.c_void_p, ctypes.c_uint32)
+        _K32.TerminateProcess.restype = ctypes.c_int
+        return bool(_K32.TerminateProcess(h, 1))
+    finally:
+        _K32.CloseHandle(h)
+
+
+def _native_proc_exe():
+    for d in (APP_DIR, BUNDLE_DIR):
+        p = os.path.join(d, "ProcUninst.exe")
+        if os.path.isfile(p):
+            return p
+    return ""
+
+
+def _procuninst_classpath():
+    for d in (APP_DIR, BUNDLE_DIR):
+        cp = os.path.join(d, "native")
+        if os.path.isfile(os.path.join(cp, "ProcUninstLog.class")):
+            return cp
+    return ""
+
+
+def _procuninst_java():
+    return shutil.which("java") or shutil.which("java.exe") or ""
+
+
+def _write_procuninst_log(events):
+    """优先交由 Java 组件写入日志，缺失时由 Python 追加写入。"""
+    log_path = os.path.join(APP_DIR, "procuninst.log")
+    ev_path = os.path.join(APP_DIR, "_procuninst_events.tmp")
+    with open(ev_path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(events) + "\n")
+    cp = _procuninst_classpath()
+    java = _procuninst_java()
+    if cp and java:
+        try:
+            r = subprocess.run(
+                [java, "-cp", cp, "ProcUninstLog", ev_path, log_path],
+                timeout=60, capture_output=True,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if r.returncode == 0:
+                return "java"
+        except Exception:
+            pass
+    stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(log_path, "a", encoding="utf-8") as fh:
+        fh.write("[%s] 进程疏通开始，事件 %d 条\n" % (stamp, len(events)))
+        for line in events:
+            fh.write("[%s] %s\n" % (stamp, " ".join(line.split("|"))))
+    return "python"
+
+
+def _run_native_procuninst(native, cpu, mem, ev_path):
+    try:
+        r = subprocess.run(
+            [native, "--events", ev_path, "--cpu", str(cpu), "--mem", str(mem)],
+            timeout=180, capture_output=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if r.returncode != 0 or not os.path.isfile(ev_path):
+            return None
+        with open(ev_path, "r", encoding="utf-8") as fh:
+            return [x.strip() for x in fh if x.strip()]
+    except Exception:
+        return None
+
+
+def _proc_restart_explorer(events, dry_run=False):
+    stopped = 0
+    for pid, info in _proc_snapshot().items():
+        if info["name"].lower() != "explorer.exe":
+            continue
+        if dry_run or _proc_terminate(pid):
+            stopped += 1
+            events.append("RESTART|%d|explorer.exe|0|0|%s" % (
+                pid, "干跑：跳过资源管理器" if dry_run else "已结束资源管理器"))
+    if dry_run:
+        events.append("RESTART|0|explorer.exe|0|0|干跑：跳过重启")
+        return stopped
+    import time
+    time.sleep(0.7)
+    try:
+        subprocess.Popen([os.path.join(WINDIR, "explorer.exe")])
+        ok = True
+    except Exception:
+        ok = False
+    events.append("RESTART|0|explorer.exe|0|0|%s" %
+                  ("已重启资源管理器" if ok else "重启资源管理器失败"))
+    return stopped
+
+
+def _proc_summary(events, engine, logger):
+    def count(tag):
+        return sum(1 for e in events if e.startswith(tag + "|"))
+
+    return {
+        "ok": True,
+        "engine": engine,
+        "logger": logger,
+        "terminated": count("TERMINATE") + count("DRYRUN"),
+        "failed": count("FAIL"),
+        "skipped": count("SKIP"),
+        "restart": count("RESTART"),
+        "events": len(events),
+        "log": os.path.join(APP_DIR, "procuninst.log"),
+    }
+
+
+def proc_uninst(dry_run: bool = False) -> dict:
+    """结束高负荷非必要进程并重启资源管理器，返回事件摘要。"""
+    import time
+    cfg = load_settings()
+    try:
+        cpu_limit = float(cfg.get("proc_cpu", PROC_CPU_DEFAULT) or PROC_CPU_DEFAULT)
+    except (TypeError, ValueError):
+        cpu_limit = PROC_CPU_DEFAULT
+    try:
+        mem_limit = int(cfg.get("proc_mem_mb", PROC_MEM_DEFAULT) or PROC_MEM_DEFAULT)
+    except (TypeError, ValueError):
+        mem_limit = PROC_MEM_DEFAULT
+
+    ev_path = os.path.join(APP_DIR, "_procuninst_events.tmp")
+    native = _native_proc_exe()
+    if native and not dry_run:
+        try:
+            if os.path.exists(ev_path):
+                os.remove(ev_path)
+        except OSError:
+            pass
+        native_events = _run_native_procuninst(native, cpu_limit, mem_limit, ev_path)
+        if native_events is not None:
+            logger = _write_procuninst_log(native_events)
+            return _proc_summary(native_events, "cpp", logger)
+
+    procs = _proc_snapshot()
+    self_pid = os.getpid()
+    self_ppid = procs.get(self_pid, {}).get("ppid", 0)
+    first = {pid: _proc_cpu_ticks(pid) for pid in procs}
+    time.sleep(PROC_SAMPLE_SECS)
+    interval = PROC_SAMPLE_SECS * 10000000
+
+    events = []
+    terminated = failed = skipped = 0
+    for pid, info in procs.items():
+        name = info["name"]
+        path, mem = _proc_details(pid)
+        reason = _proc_protected(pid, name, path, info["ppid"],
+                                 self_pid, self_ppid)
+        if reason:
+            skipped += 1
+            events.append("SKIP|%d|%s|0|0|%s" % (pid, name, reason))
+            continue
+        now = _proc_cpu_ticks(pid)
+        cpu = max(0.0, (now - first.get(pid, now)) / interval)
+        mem_mb = mem // (1024 * 1024)
+        if cpu < cpu_limit and mem_mb < mem_limit:
+            continue
+        head = "|%d|%s|%.1f|%d" % (pid, name, cpu * 100, mem_mb)
+        if dry_run:
+            terminated += 1
+            events.append("DRYRUN" + head + "|高负荷")
+            continue
+        if _proc_terminate(pid):
+            terminated += 1
+            events.append("TERMINATE" + head + "|高负荷进程已结束")
+        else:
+            failed += 1
+            events.append("FAIL" + head + "|无权限或进程已退出")
+
+    _proc_restart_explorer(events, dry_run)
+    events.append("SUMMARY|0|ForceRm|0|0|结束 %d 个，失败 %d 个，跳过 %d 个" %
+                  (terminated, failed, skipped))
+    logger = _write_procuninst_log(events)
+    return _proc_summary(events, "ctypes", logger)
+
+
+def _elevate_procuninst():
+    try:
+        shell32 = ctypes.windll.shell32
+        shell32.ShellExecuteW.argtypes = (
+            ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_wchar_p,
+            ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_int)
+        shell32.ShellExecuteW.restype = ctypes.c_void_p
+        args = "--procuninst --elevated"
+        if getattr(sys, "frozen", False):
+            exe, params = sys.executable, args
+        else:
+            exe = sys.executable or "pythonw.exe"
+            params = '"%s" %s' % (os.path.abspath(__file__), args)
+        ret = shell32.ShellExecuteW(None, "runas", exe, params, None, 1)
+        return ret is not None and int(ret) > 32
+    except Exception:
+        return False
+
+
+def procuninst_cli() -> int:
+    if ("--elevated" not in sys.argv and not is_admin()
+            and bool(load_settings().get("auto_elevate", True))):
+        if _elevate_procuninst():
+            return 0
+    result = proc_uninst()
+    try:
+        with open(os.path.join(APP_DIR, "_procuninst_result.json"),
+                  "w", encoding="utf-8") as fh:
+            json.dump(result, fh, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+    return 0 if result.get("ok") else 1
 
 
 # --------------------------------------------------------------------------
@@ -1854,7 +2252,11 @@ if __name__ == "__main__":
     if "--selftest" in sys.argv:
         _out = {
             "frozen": bool(getattr(sys, "frozen", False)),
+            "onefile": bool(getattr(sys, "_MEIPASS", "")),
             "app_dir": APP_DIR,
+            "bundle_dir": BUNDLE_DIR,
+            "logo_path": LOGO_PATH,
+            "logo_exists": os.path.isfile(LOGO_PATH),
             "lib_dir": LIBRM_DIR,
             "lib_exists": os.path.isdir(LIBRM_DIR),
             "lib_rules": len(load_software_targets(LIBRM_DIR)),
@@ -1872,10 +2274,17 @@ if __name__ == "__main__":
             "win_dism": WIN["supports_dism"],
             "version_rules": sum(1 for t in JUNK_TARGETS
                                  if t["key"].startswith("ver_")),
+            "procuninst": {
+                "native_exe": bool(_native_proc_exe()),
+                "java_class": bool(_procuninst_classpath()),
+                "java": bool(_procuninst_java()),
+            },
         }
         with open(os.path.join(APP_DIR, "_selftest.json"), "w", encoding="utf-8") as _fh:
             json.dump(_out, _fh, ensure_ascii=False, indent=2)
         sys.exit(0)
+    if "--procuninst" in sys.argv:
+        sys.exit(procuninst_cli())
     # 自动提权：非管理员且本身不是提权实例时，重启自身申请 UAC 后退出
     if "--elevated" not in sys.argv and not is_admin() \
             and bool(load_settings().get("auto_elevate", True)):
